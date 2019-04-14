@@ -1,15 +1,18 @@
 package main
 
 import (
+	"crypto/rsa"
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
+	"github.com/dgrijalva/jwt-go"
+	"github.com/dgrijalva/jwt-go/request"
 	"github.com/go-chi/chi"
 	"github.com/go-chi/chi/middleware"
 	"github.com/go-chi/render"
@@ -18,6 +21,18 @@ import (
 	_ "github.com/golang-migrate/migrate/source/file"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
+)
+
+// location of the files used for signing and verification
+const (
+	privKeyPath = "keys/app.rsa"     // openssl genrsa -out app.rsa 2048
+	pubKeyPath  = "keys/app.rsa.pub" // openssl rsa -in app.rsa -pubout > app.rsa.pub
+)
+
+var (
+	verifyKey *rsa.PublicKey
+	signKey   *rsa.PrivateKey
 )
 
 type App struct {
@@ -33,6 +48,13 @@ type Teacher struct {
 	IsDisabled   bool   `db:"is_disabled"`
 	CreatedAt    string `db:"created_at"`
 	UpdatedAt    string `db:"updated_at"`
+}
+
+type CustomClaimsExample struct {
+	*jwt.StandardClaims
+	TokenType       string
+	TeacherID       int64
+	TeacherUsername string
 }
 
 type TeacherRequest struct {
@@ -55,6 +77,18 @@ func main() {
 	r.Use(middleware.URLFormat)
 	r.Use(render.SetContentType(render.ContentTypeJSON))
 
+	signBytes, err := ioutil.ReadFile(privKeyPath)
+	fatal(err)
+
+	signKey, err = jwt.ParseRSAPrivateKeyFromPEM(signBytes)
+	fatal(err)
+
+	verifyBytes, err := ioutil.ReadFile(pubKeyPath)
+	fatal(err)
+
+	verifyKey, err = jwt.ParseRSAPublicKeyFromPEM(verifyBytes)
+	fatal(err)
+
 	db, err := sqlx.Connect("postgres", "user=william password= william dbname=chi-test sslmode=require")
 	if err != nil {
 		log.Fatal(err)
@@ -74,6 +108,7 @@ func main() {
 	// r.Get("/list_people", ListPeople(app))
 	r.Post("/teacher", CreateTeacher(app))
 	r.Post("/login", Login(app))
+	r.Post("/restricted", RestrictedHandler(app))
 	http.ListenAndServe(":3333", r)
 }
 
@@ -151,12 +186,73 @@ func Login(app *App) http.HandlerFunc {
 			render.Render(w, r, ErrInvalidRequest(err))
 			return
 		}
-
+		fmt.Println("tsra")
 		teacher := dbGetTeacherByUsername(app, login.Username)
-		result := ComparePasswords(teacher.PasswordHash, login.Password)
-		fmt.Println(result)
-		fmt.Println(teacher)
-		// TODO add a response
+		if !ComparePasswords(teacher.PasswordHash, login.Password) {
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprintln(w, "Wrong info")
+			return
+		}
+		fmt.Println("ts5ra")
+
+		tokenString, err := CreateToken(teacher)
+
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintln(w, "Sorry, error while Signing Token!")
+			log.Printf("Token Signing error: %v\n", err)
+			return
+		}
+		fmt.Println("t4sra")
+		fmt.Println(tokenString)
+
+		w.Header().Set("Content-Type", "application/jwt")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, tokenString)
+	}
+}
+
+// CreateToken creates a JWToken
+func CreateToken(teacher Teacher) (string, error) {
+	t := jwt.New(jwt.GetSigningMethod("RS256"))
+
+	// set our claims
+	t.Claims = &CustomClaimsExample{
+		&jwt.StandardClaims{
+			// set the expire time
+			// see http://tools.ietf.org/html/draft-ietf-oauth-json-web-token-20#section-4.1.4
+			ExpiresAt: time.Now().Add(time.Minute * 1).Unix(),
+		},
+		"level1",
+		teacher.ID,
+		teacher.Username,
+	}
+
+	return t.SignedString(signKey)
+}
+
+func RestrictedHandler(app *App) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Get token from request
+		token, err := request.ParseFromRequestWithClaims(r, request.OAuth2Extractor, &CustomClaimsExample{}, func(token *jwt.Token) (interface{}, error) {
+			// since we only use the one private key to sign the tokens,
+			// we also only use its public counter part to verify
+			return verifyKey, nil
+		})
+
+		fmt.Println(token)
+		fmt.Println(err)
+
+		// If the token is missing or invalid, return error
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprintln(w, "Invalid token:", err)
+			return
+		}
+
+		// Token is valid
+		fmt.Fprintln(w, "Welcome,", token.Claims.(*CustomClaimsExample).TeacherUsername)
+		return
 	}
 }
 
@@ -228,4 +324,10 @@ type ErrResponse struct {
 func (e *ErrResponse) Render(w http.ResponseWriter, r *http.Request) error {
 	render.Status(r, e.HTTPStatusCode)
 	return nil
+}
+
+func fatal(err error) {
+	if err != nil {
+		log.Fatal(err)
+	}
 }

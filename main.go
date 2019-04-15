@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rsa"
 	"database/sql"
 	"errors"
@@ -108,7 +109,7 @@ func main() {
 	// r.Get("/list_people", ListPeople(app))
 	r.Post("/teacher", CreateTeacher(app))
 	r.Post("/login", Login(app))
-	r.Post("/restricted", RestrictedHandler(app))
+	r.With(JWTMiddleware).Post("/restricted", RestrictedHandler(app))
 	http.ListenAndServe(":3333", r)
 }
 
@@ -129,18 +130,6 @@ func MakeMigration(steps int) {
 		"postgres", driver)
 	m.Steps(steps)
 }
-
-// func ListPeople(app *App) http.HandlerFunc {
-// 	return func(w http.ResponseWriter, r *http.Request) {
-// 		people := []Person{}
-// 		app.db.Select(&people, "SELECT * FROM person ORDER BY first_name ASC")
-// 		jason, john := people[0], people[1]
-
-// 		fmt.Printf("%#v\n%#v", jason, john)
-
-// 		fmt.Fprintf(w, "%#v\n%#v", jason, john)
-// 	}
-// }
 
 // HashAndSalt a string password
 func HashAndSalt(pwd string) string {
@@ -233,25 +222,9 @@ func CreateToken(teacher Teacher) (string, error) {
 
 func RestrictedHandler(app *App) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Get token from request
-		token, err := request.ParseFromRequestWithClaims(r, request.OAuth2Extractor, &CustomClaimsExample{}, func(token *jwt.Token) (interface{}, error) {
-			// since we only use the one private key to sign the tokens,
-			// we also only use its public counter part to verify
-			return verifyKey, nil
-		})
-
-		fmt.Println(token)
-		fmt.Println(err)
-
-		// If the token is missing or invalid, return error
-		if err != nil {
-			w.WriteHeader(http.StatusUnauthorized)
-			fmt.Fprintln(w, "Invalid token:", err)
-			return
-		}
-
+		customClaim := r.Context().Value("CustomClaim").(*CustomClaimsExample)
 		// Token is valid
-		fmt.Fprintln(w, "Welcome,", token.Claims.(*CustomClaimsExample).TeacherUsername)
+		fmt.Fprintln(w, "Welcome,", customClaim.TeacherUsername)
 		return
 	}
 }
@@ -330,4 +303,29 @@ func fatal(err error) {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+// HTTP middleware setting a value on the request context
+func JWTMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token, err := request.ParseFromRequestWithClaims(r, request.OAuth2Extractor, &CustomClaimsExample{}, func(token *jwt.Token) (interface{}, error) {
+			// since we only use the one private key to sign the tokens,
+			// we also only use its public counter part to verify
+			return verifyKey, nil
+		})
+
+		fmt.Println(token)
+		fmt.Println(err)
+
+		// If the token is missing or invalid, return error
+		if err != nil {
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprintln(w, "Invalid token:", err)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), "CustomClaim", token.Claims.(*CustomClaimsExample))
+
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
